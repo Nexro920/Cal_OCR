@@ -1,0 +1,13 @@
+# .gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 忽略生成的图片数据集
+math_captchas/
+
+# 忽略打包生成的临时文件
+build/
+dist/
+*.egg-info/

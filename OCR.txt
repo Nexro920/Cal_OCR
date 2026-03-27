@@ -1,0 +1,398 @@
+====================
+FILE PATH : D:\Scripts\LearnSelenium\Cal_OCR\setup.py
+from setuptools import setup, find_packages
+
+setup(
+    name="cal_ocr", # 用户 pip install 的名字
+    version="0.1.0",
+    author="Your Name",
+    description="A CRNN+CTC based OCR model for solving mathematical equation captchas.",
+    packages=find_packages(), # 自动寻找 cal_ocr 文件夹
+    include_package_data=True, # 允许打包非 .py 文件
+    package_data={
+        # 这一行确保打包时将权重文件带上
+        "cal_ocr": ["weights/*.pth"],
+    },
+    install_requires=[
+        "torch>=1.9.0",
+        "torchvision",
+        "opencv-python",
+        "pandas",
+    ],
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "License :: OSI Approved :: MIT License",
+    ],
+)
+
+====================
+FILE PATH : D:\Scripts\LearnSelenium\Cal_OCR\cal_ocr\ocr_dataset.py
+import os
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+import torchvision.transforms as transforms
+import cv2
+
+# CTC 必须要有一个占位用的空白符 (Blank)，放在 index 0。将原本的 '-' 改为 '_' 避免与减号冲突。
+VOCAB = "_0123456789+-*/="
+CHAR2IDX = {char: idx for idx, char in enumerate(VOCAB)}
+IDX2CHAR = {idx: char for idx, char in enumerate(VOCAB)}
+
+class CaptchaDataset(Dataset):
+    def __init__(self, csv_file, img_dir, transform=None):
+        df = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.filenames = df['filename'].tolist()
+        self.labels_str = df['label'].tolist()
+
+        self.transform = transform or transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5])
+        ])
+
+    def __len__(self):
+        return len(self.filenames)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.img_dir, self.filenames[idx])
+
+        # 使用 OpenCV 读取单通道灰度图
+        image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if self.transform:
+            image = self.transform(image)
+
+        label_str = self.labels_str[idx]
+        target = [CHAR2IDX[c] for c in label_str]
+        target_length = len(target)
+
+        # 直接返回真实长度的 target tensor，Padding 交给 collate_fn 处理
+        return image, torch.tensor(target, dtype=torch.long), target_length
+
+def collate_fn(batch):
+    """动态 Padding，将同一 Batch 内的标签补齐到该 Batch 的最大长度"""
+    images, targets, target_lengths = zip(*batch)
+    images = torch.stack(images, 0)
+    # 使用空白符 (0) 进行填充
+    targets = pad_sequence(targets, batch_first=True, padding_value=0)
+    target_lengths = torch.tensor(target_lengths, dtype=torch.long)
+    return images, targets, target_lengths
+
+def get_dataloader(csv_file, img_dir, batch_size=64, shuffle=True, num_workers=4, drop_last=True):
+    dataset = CaptchaDataset(csv_file=csv_file, img_dir=img_dir)
+    return DataLoader(
+        dataset, batch_size=batch_size, shuffle=shuffle,
+        num_workers=num_workers, drop_last=drop_last, pin_memory=True, collate_fn=collate_fn
+    )
+
+====================
+FILE PATH : D:\Scripts\LearnSelenium\Cal_OCR\cal_ocr\ocr_model.py
+import torch
+import torch.nn as nn
+
+class CRNN(nn.Module):
+    def __init__(self, num_classes, image_channels=1):
+        super(CRNN, self).__init__()
+
+        # CNN 骨干网络：高度缩减至 1，宽度保留为时间步
+        self.cnn = nn.Sequential(
+            nn.Conv2d(image_channels, 32, 3, 1, 1), nn.BatchNorm2d(32), nn.ReLU(True),
+            nn.MaxPool2d(2, 2), # 60x160 -> 30x80
+
+            nn.Conv2d(32, 64, 3, 1, 1), nn.BatchNorm2d(64), nn.ReLU(True),
+            nn.MaxPool2d(2, 2), # 30x80 -> 15x40
+
+            nn.Conv2d(64, 128, 3, 1, 1), nn.BatchNorm2d(128), nn.ReLU(True),
+            nn.MaxPool2d((2, 1), (2, 1)), # 15x40 -> 7x40 (高度减半，宽度保持)
+
+            nn.Conv2d(128, 256, 3, 1, 1), nn.BatchNorm2d(256), nn.ReLU(True),
+            nn.MaxPool2d((7, 1), (7, 1)) # 7x40 -> 1x40 (高度压扁为1，时间步T=40)
+        )
+
+        # RNN 序列网络
+        self.rnn = nn.LSTM(input_size=256, hidden_size=128, bidirectional=True, batch_first=True)
+        self.fc = nn.Linear(128 * 2, num_classes)
+
+    def forward(self, x):
+        # 1. CNN 提取特征
+        conv = self.cnn(x) # [Batch, 256, 1, 40]
+
+        # 2. 形状变换适配 RNN：[Batch, Channels, Height, Width] -> [Batch, Width, Channels]
+        b, c, h, w = conv.size()
+        conv = conv.squeeze(2) # [Batch, 256, 40]
+        conv = conv.permute(0, 2, 1) # [Batch, 40, 256] (即 [Batch, T, Features])
+
+        # 3. RNN 处理序列
+        rnn_out, _ = self.rnn(conv) # [Batch, 40, 256]
+
+        # 4. 全连接映射到类别
+        output = self.fc(rnn_out) # [Batch, 40, num_classes]
+
+        # PyTorch 的 CTCLoss 默认期望 [T, Batch, Num_classes]
+        output = output.permute(1, 0, 2)
+
+        # CTCLoss 要求输入是对数概率
+        return nn.functional.log_softmax(output, dim=2)
+
+====================
+FILE PATH : D:\Scripts\LearnSelenium\Cal_OCR\cal_ocr\predict.py
+import torch
+import torchvision.transforms as transforms
+import cv2
+import os
+import re
+import operator
+
+from ocr_model import CRNN
+from ocr_dataset import VOCAB, IDX2CHAR
+from train import decode_predictions
+
+class CaptchaPredictor:
+    def __init__(self, weight_path=None, device=None):
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"))
+        if weight_path is None:
+            # 获取当前 predict.py 所在的目录
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            weight_path = os.path.join(current_dir, "weights", "best_crnn_model.pth")
+        print(f"🚀 初始化 OCR 推理引擎，使用设备: {self.device}")
+
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5])
+        ])
+
+        self.model = CRNN(num_classes=len(VOCAB)).to(self.device)
+        self.model.load_state_dict(torch.load(weight_path, map_location=self.device))
+        self.model.eval()
+
+    def safe_eval(self, math_expr):
+        """ 严格的基于正则与栈映射的安全计算器 """
+        ops = {'+': operator.add, '-': operator.sub, '*': operator.mul, '/': operator.truediv}
+
+        match = re.match(r'^(\d+)([\+\-\*/])(\d+)$', math_expr)
+        if not match:
+            return f"Error: 语法解析失败 ({math_expr})"
+
+        num1, op, num2 = int(match.group(1)), match.group(2), int(match.group(3))
+
+        if op == '/' and num2 == 0:
+            return "Error: 除零错误"
+
+        return int(ops[op](num1, num2))
+
+    def predict(self, image_path):
+        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            return "Error", "图片读取失败"
+
+        # 核心修复：强制 Resize，保证高度必然为 60，防止非标图片导致模型崩溃
+        image = cv2.resize(image, (160, 60))
+
+        image_tensor = self.transform(image).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            output = self.model(image_tensor)
+
+        decoded_str = decode_predictions(output)[0]
+
+        math_expr = decoded_str.replace('=', '')
+        answer = self.safe_eval(math_expr)
+
+        return decoded_str, answer
+
+if __name__ == '__main__':
+    predictor = CaptchaPredictor()
+    test_image_path = "math_captchas/val/008001.png"
+
+    if os.path.exists(test_image_path):
+        equation, answer = predictor.predict(test_image_path)
+        print("-" * 30)
+        print(f"🤖 识别公式: {equation}")
+        print(f"✅ 最终答案: {answer}")
+        print("-" * 30)
+
+====================
+FILE PATH : D:\Scripts\LearnSelenium\Cal_OCR\cal_ocr\train.py
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm import tqdm
+import os
+
+from ocr_dataset import get_dataloader, VOCAB, IDX2CHAR
+from ocr_model import CRNN
+
+def decode_predictions(preds):
+    """ CTC 贪心解码：合并重复项，去除空白符 """
+    _, max_indices = torch.max(preds, dim=2) # [T, Batch]
+    max_indices = max_indices.permute(1, 0).cpu().numpy() # [Batch, T]
+
+    decoded_strings = []
+    for seq in max_indices:
+        char_list = []
+        for i in range(len(seq)):
+            if seq[i] != 0 and (not (i > 0 and seq[i - 1] == seq[i])): # 0 是 Blank
+                char_list.append(IDX2CHAR[seq[i]])
+        decoded_strings.append(''.join(char_list))
+    return decoded_strings
+
+def train_model(num_epochs=50, batch_size=128, learning_rate=0.001):
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"🚀 当前使用设备: {device}")
+    os.makedirs("weights", exist_ok=True)
+
+    # 验证集不应 drop_last，保证评估准确性。启用多进程加载加速。
+    train_loader = get_dataloader(csv_file="math_captchas/train_labels.csv", img_dir="math_captchas/train", batch_size=batch_size, shuffle=True, drop_last=True, num_workers=4)
+    val_loader = get_dataloader(csv_file="math_captchas/val_labels.csv", img_dir="math_captchas/val", batch_size=batch_size, shuffle=False, drop_last=False, num_workers=4)
+
+    model = CRNN(num_classes=len(VOCAB)).to(device)
+
+    criterion = nn.CTCLoss(blank=0, zero_infinity=True)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-5)
+
+    # 修复：确保 scaler 只在 cuda 下完全启用
+    scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
+
+    best_acc = 0.0
+
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0.0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")
+
+        for images, targets, target_lengths in pbar:
+            images = images.to(device)
+            targets = targets.to(device)
+            batch_s = images.size(0)
+
+            optimizer.zero_grad()
+            with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+                preds = model(images)
+                input_lengths = torch.full(size=(batch_s,), fill_value=preds.size(0), dtype=torch.long)
+                loss = criterion(preds, targets, input_lengths, target_lengths)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            train_loss += loss.item()
+            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'lr': f"{optimizer.param_groups[0]['lr']:.5f}"})
+
+        scheduler.step()
+
+        # 验证阶段
+        model.eval()
+        correct_sentences, total_sentences = 0, 0
+
+        with torch.no_grad():
+            for images, targets, target_lengths in val_loader:
+                images = images.to(device)
+                preds = model(images)
+
+                decoded_preds = decode_predictions(preds)
+
+                targets = targets.cpu().numpy()
+                target_lengths = target_lengths.cpu().numpy()
+                for i in range(len(decoded_preds)):
+                    true_seq = targets[i][:target_lengths[i]]
+                    true_str = ''.join([IDX2CHAR[c] for c in true_seq])
+                    if decoded_preds[i] == true_str:
+                        correct_sentences += 1
+                total_sentences += len(decoded_preds)
+
+        val_acc = correct_sentences / total_sentences
+        print(f"Epoch {epoch+1} -> Train Loss: {train_loss/len(train_loader):.4f} | Val Sentence Acc: {val_acc*100:.2f}%")
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), "weights/best_crnn_model.pth")
+            print(f"🔥 新纪录！模型已保存！")
+
+if __name__ == '__main__':
+    train_model(num_epochs=30, batch_size=128, learning_rate=0.001)
+
+====================
+FILE PATH : D:\Scripts\LearnSelenium\Cal_OCR\cal_ocr\__init__.py
+# cal_ocr/__init__.py
+from .predict import CaptchaPredictor
+from .ocr_model import CRNN
+
+__version__ = "0.1.0"
+__all__ = ["CaptchaPredictor", "CRNN"]
+
+====================
+FILE PATH : D:\Scripts\LearnSelenium\Cal_OCR\scripts\generate_captchas_img.py
+from captcha.image import ImageCaptcha
+import random
+import os
+import csv
+import multiprocessing
+
+save_dir = r"math_captchas"
+train_dir = os.path.join(save_dir, "train")
+val_dir = os.path.join(save_dir, "val")
+os.makedirs(train_dir, exist_ok=True)
+os.makedirs(val_dir, exist_ok=True)
+
+captcha_generator = ImageCaptcha(width=160, height=60)
+
+def generate_single_image(args):
+    i, total_images, train_ratio, t_dir, v_dir = args
+
+    operator = random.choice(['+', '-', '*', '/'])
+
+    if operator == '/':
+        num2 = random.randint(1, 30)
+        expected_answer = random.randint(1, 15)
+        num1 = num2 * expected_answer
+        text = f"{num1}/{num2}="
+        answer = expected_answer
+    else:
+        num1 = random.randint(1, 99)
+        num2 = random.randint(1, 99)
+        if operator == '-' and num1 < num2:
+            num1, num2 = num2, num1
+
+        text = f"{num1}{operator}{num2}="
+        # 这里仅用于生成标签答案，生成阶段是安全的
+        answer = int(eval(f"{num1}{operator}{num2}"))
+
+    filename = f"{i:06d}.png"
+
+    if i < total_images * train_ratio:
+        filepath = os.path.join(t_dir, filename)
+        split_type = "train"
+    else:
+        filepath = os.path.join(v_dir, filename)
+        split_type = "val"
+
+    captcha_generator.write(text, filepath)
+
+    # 直接返回变长 text 作为 label
+    return {"filename": filename, "label": text, "answer": answer, "split": split_type}
+
+if __name__ == '__main__':
+    total_images = 10000
+    train_ratio = 0.8
+    print("开始多进程生成变长验证码数据集...")
+
+    pool_args = [(i, total_images, train_ratio, train_dir, val_dir) for i in range(total_images)]
+
+    with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
+        results = pool.map(generate_single_image, pool_args)
+
+    train_data = [r for r in results if r['split'] == 'train']
+    val_data = [r for r in results if r['split'] == 'val']
+
+    for split_name, data in [("train", train_data), ("val", val_data)]:
+        csv_path = os.path.join(save_dir, f"{split_name}_labels.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["filename", "label", "answer", "split"])
+            writer.writeheader()
+            writer.writerows(data)
+
+    print(f"生成完毕！共生成 {total_images} 张图片。标签为真实长度，完美适配 CRNN + CTC。")
+
