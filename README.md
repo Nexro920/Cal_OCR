@@ -11,7 +11,7 @@
 
 ```bash
 # Clone 仓库
-git clone [https://github.com/YourUsername/Cal_OCR_Project.git](https://github.com/YourUsername/Cal_OCR_Project.git)
+git clone [https://github.com/Nexro920/Cal_OCR.git]
 cd Cal_OCR_Project
 
 # 本地安装包
