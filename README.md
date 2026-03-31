@@ -4,7 +4,7 @@
 
 # Cal_OCR: 基于 CRNN+CTC 的数学公式验证码识别引擎
 
-Cal_OCR 是一个专为解决**变长、高难度干扰（重度污染）数学验证码**而设计的轻量级光学字符识别（OCR）项目 [cite: 1]。该项目采用经典的 `CNN + BiLSTM + CTC Loss` 架构，支持端到端的“所见即所得”字符识别，无需预先切分字符 [cite: 8, 9, 18]。
+Cal_OCR 是一个专为解决**变长、高难度干扰（重度污染）数学验证码**而设计的轻量级光学字符识别（OCR）项目 。该项目采用经典的 `CNN + BiLSTM + CTC Loss` 架构，支持端到端的“所见即所得”字符识别，无需预先切分字符 。
 
 ## ✨ 核心特性
 
@@ -82,14 +82,14 @@ print(f"预测结果: {result_str}")
 ```text
 Cal_OCR/
 ├── cal_ocr/                 # 核心算法包
-│   ├── __init__.py          # 模块导出声明 [cite: 28]
-│   ├── ocr_dataset.py       # 数据集定义、预处理与在线增强逻辑 [cite: 2, 4]
-│   ├── ocr_model.py         # CRNN (CNN特征提取 + LSTM序列建模) 网络结构 [cite: 7]
-│   ├── predict.py           # 推理类与贪心解码逻辑 [cite: 10, 11, 12]
-│   ├── train.py             # 训练主循环、CER计算与验证逻辑 [cite: 16]
-│   └── weights/             # 存放训练输出的 .pth 模型权重文件 [cite: 17]
+│   ├── __init__.py          # 模块导出声明 
+│   ├── ocr_dataset.py       # 数据集定义、预处理与在线增强逻辑 
+│   ├── ocr_model.py         # CRNN (CNN特征提取 + LSTM序列建模) 网络结构 
+│   ├── predict.py           # 推理类与贪心解码逻辑 
+│   ├── train.py             # 训练主循环、CER计算与验证逻辑 
+│   └── weights/             # 存放训练输出的 .pth 模型权重文件 
 ├── scripts/
-│   └── generate_captchas_img.py  # 验证码生成器 (添加形变、噪点、干扰线) [cite: 29]
-├── setup.py                 # 包安装配置 [cite: 1]
+│   └── generate_captchas_img.py  # 验证码生成器 (添加形变、噪点、干扰线) 
+├── setup.py                 # 包安装配置 
 └── README.md                # 项目文档
 ```
